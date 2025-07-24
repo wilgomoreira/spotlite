@@ -17,6 +17,7 @@ import warnings
 from rasterio.errors import NotGeoreferencedWarning
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 from collections import defaultdict
+from rasterio.enums import ColorInterp
 
 def show_img_jpg(img):
     img = mpimg.imread(img)
@@ -51,61 +52,71 @@ def generate_tile_paths_auto(base_path, prefix, extension=".TIF"):
 
     return tile_paths, max_row, max_col
 
-def show_all_tiles_grid(tile_paths, rows, cols, bands=[1, 2, 3], scale=1/10):
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
+
+def show_all_tiles_grid(tile_paths, rows, cols, scale=1/10):
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2),
+                             gridspec_kw={'wspace': 0.01, 'hspace': 0.01})
+
     if rows == 1 and cols == 1:
         axes = np.array([[axes]])
     elif rows == 1 or cols == 1:
         axes = axes.reshape((rows, cols))
 
     for idx, path in enumerate(tile_paths):
-        r = idx // cols
-        c = idx % cols
+        r, c = divmod(idx, cols)
         ax = axes[r][c]
 
         if path == "MISSING":
             ax.set_facecolor('lightgrey')
-            ax.text(0.5, 0.5, "Missing Tile", fontsize=10, ha='center', va='center')
+            ax.text(0.5, 0.5, "Missing Tile",
+                    fontsize=10, ha='center', va='center')
             ax.axis('off')
         else:
             try:
-                img = show_img_tile(path, bands=bands, scale=scale)
+                img = show_img_tile(path, scale=scale)
                 ax.imshow(img)
                 ax.axis('off')
             except Exception as e:
                 print(f"Error loading {path}: {e}")
                 ax.set_facecolor('red')
-                ax.text(0.5, 0.5, "Error", fontsize=10, ha='center', va='center')
+                ax.text(0.5, 0.5, "Error",
+                        fontsize=10, ha='center', va='center')
                 ax.axis('off')
 
     plt.tight_layout()
     plt.show()
 
-def show_img_tile(filepath, bands=[1, 2, 3], scale=1.0):
+
+def show_img_tile(filepath, scale=1.0):
+   
     with rasterio.open(filepath) as src:
-        image = src.read(bands)
+        interp = src.colorinterp  
+        mapping = {ci: i + 1 for i, ci in enumerate(interp)}
+        bands = [
+            mapping[ColorInterp.red],
+            mapping[ColorInterp.green],
+            mapping[ColorInterp.blue],
+        ]
+        img = src.read(bands).astype(np.float32)
 
-        def normalize(band):
-            min_val = band.min()
-            max_val = band.max()
-            if max_val == min_val:
-                return np.zeros_like(band, dtype=np.uint8)
-            return ((band - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+    img = np.transpose(img, (1, 2, 0))
 
-        image_norm = np.stack([normalize(image[i]) for i in range(image.shape[0])], axis=0)
+    p2, p98 = np.percentile(img, (2, 98))
+    if p98 - p2 > 1e-5:
+        img_norm = np.clip((img - p2) / (p98 - p2), 0, 1)
+    else:
+        img_norm = np.zeros_like(img)
 
-        if scale < 1.0:
-            height = int(image.shape[1] * scale)
-            width = int(image.shape[2] * scale)
-            image_resized = np.zeros((image.shape[0], height, width), dtype=np.uint8)
-            for i in range(image.shape[0]):
-                band_img = Image.fromarray(image_norm[i])
-                band_img_resized = band_img.resize((width, height))
-                image_resized[i] = np.array(band_img_resized)
-            image_norm = image_resized
+    if scale < 1.0:
+        h, w, _ = img_norm.shape
+        new_h = int(h * scale)
+        new_w = int(w * scale)
+        img_uint8 = (img_norm * 255).astype(np.uint8)
+        pil = Image.fromarray(img_uint8)
+        pil = pil.resize((new_w, new_h), Image.BILINEAR)
+        img_norm = np.asarray(pil).astype(np.float32) / 255.0
 
-        image_rgb = np.transpose(image_norm, (1, 2, 0))
-        return image_rgb
+    return img_norm
     
 def show_classes(label_path, name_path=None):
     # Load shapefile
