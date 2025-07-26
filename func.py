@@ -241,6 +241,7 @@ def assign_labels_to_tiles(gdf_labels, gdf_tiles):
 
     return gdf_intersection
 
+
 def load_full_images_and_masks(tile_paths, labels_gdf, class_column='classnum2'):
     loaded_data = []
 
@@ -249,34 +250,46 @@ def load_full_images_and_masks(tile_paths, labels_gdf, class_column='classnum2')
             continue
 
         tile_id = get_tile_id_from_path(tile_path)
-
         if tile_id not in labels_gdf['tile_id'].values:
             print(f"⚠️ No labels found for tile {tile_id}")
             continue
 
         with rasterio.open(tile_path) as src:
-            image = src.read([1, 2, 3, 4])  # RGB + NIR
+            interp = src.colorinterp
+            mapping = {ci: i+1 for i, ci in enumerate(interp)}
+            bands = [
+                mapping[ColorInterp.red],
+                mapping[ColorInterp.green],
+                mapping[ColorInterp.blue],
+                mapping.get(ColorInterp.nir,                       
+                            mapping.get(ColorInterp.undefined, 4))  
+            ]
+            image = src.read(bands).astype(np.float32)  
             transform = src.transform
             crs = src.crs
             height, width = src.height, src.width
 
-        # Normalize image
-        def normalize(band):
-            min_val = band.min()
-            max_val = band.max()
-            if max_val == min_val:
-                return np.zeros_like(band, dtype=np.uint8)
-            return ((band - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        def normalize_percentile(band):
+            p2, p98 = np.percentile(band, (2, 98))
+            if p98 - p2 > 1e-5:
+                return np.clip((band - p2) / (p98 - p2), 0, 1)
+            else:
+                return np.zeros_like(band, dtype=np.float32)
 
-        image_norm = np.stack([normalize(image[i]) for i in range(image.shape[0])], axis=0)  # shape [C, H, W]
+        image_norm = np.stack([normalize_percentile(image[i])
+                               for i in range(image.shape[0])], axis=0)
+        
 
-        # Rasterize mask
+       
         labels_tile = labels_gdf[labels_gdf['tile_id'] == tile_id]
         if not labels_tile.empty:
             if labels_tile.crs != crs:
                 labels_tile = labels_tile.to_crs(crs)
-
-            shapes = [(geom, int(val)) for geom, val in zip(labels_tile.geometry, labels_tile[class_column])]
+            shapes = [
+                (geom, int(val))
+                for geom, val in zip(labels_tile.geometry,
+                                     labels_tile[class_column])
+            ]
             mask = rasterize(
                 shapes,
                 out_shape=(height, width),
@@ -287,11 +300,10 @@ def load_full_images_and_masks(tile_paths, labels_gdf, class_column='classnum2')
         else:
             mask = np.zeros((height, width), dtype=np.uint8)
 
-        # Save to memory (not disk)
         loaded_data.append({
             "tile_id": tile_id,
-            "image": image_norm,  # shape [C, H, W]
-            "mask": mask,         # shape [H, W]
+            "image": image_norm,  # [4, H, W],
+            "mask": mask,         # [H, W]
             "transform": transform,
             "crs": crs
         })
@@ -331,153 +343,231 @@ def check_class_distribution_in_tiles_data(tiles_data):
         percent = (count / total_pixels) * 100 if total_pixels > 0 else 0
         print(f"  Class {cls}: {count:,} pixels ({percent:.2f}%)")
 
-
-def visualize_tiles_data(tiles_data, desired_classes=None, max_items=None, selected_indices=None):
-    # Filter selected indices
+def visualize_tiles_data(
+    tiles_data,
+    desired_classes=None,
+    max_items=None,
+    selected_indices=None,
+    scale=0.5,         # ↓ define aqui o fator de down‐sampling
+):
+    # 1) filtra índices e limite
     if selected_indices:
         tiles_data = [tiles_data[i] for i in selected_indices if i < len(tiles_data)]
-
     if max_items:
         tiles_data = tiles_data[:max_items]
+    if not tiles_data:
+        print("❌ No tiles to display."); return
 
-    if len(tiles_data) == 0:
-        print("❌ No tiles to display.")
-        return
-
-    # Define label info and colors
+    # 2) informações de classes e cores
     full_class_labels = [
-        "0: background",
-        "1: no trees",
-        "2: other vegetation",
-        "3: pinus",
-        "4: eucalyptus",
-        "5: shadow"
+        "0: background","1: no trees","2: other vegetation",
+        "3: pinus","4: eucalyptus","5: shadow"
     ]
     full_mask_colors = [
-        (0, 0, 0, 1.0),
-        (0.12, 0.47, 0.71, 0.6),
-        (0.20, 0.63, 0.17, 0.6),
-        (0.84, 0.15, 0.16, 0.6),
-        (0.58, 0.40, 0.74, 0.6),
-        (0.10, 0.74, 0.81, 0.6)
-    ]
-    full_overlay_colors = [
-        (0, 0, 0, 0.0),
-        (0.12, 0.47, 0.71, 0.6),
-        (0.20, 0.63, 0.17, 0.6),
-        (0.84, 0.15, 0.16, 0.6),
-        (0.58, 0.40, 0.74, 0.6),
-        (0.10, 0.74, 0.81, 0.6)
+        (0,0,0,1.0),
+        (0.12,0.47,0.71,0.6),
+        (0.20,0.63,0.17,0.6),
+        (0.84,0.15,0.16,0.6),
+        (0.58,0.40,0.74,0.6),
+        (0.10,0.74,0.81,0.6),
     ]
 
-    # Get all classes in current masks
-    present_classes = set()
+    # 3) descobre classes presentes
+    present = set()
     for tile in tiles_data:
-        present_classes.update(np.unique(tile["mask"]))
-    present_classes = sorted(present_classes)
+        present.update(np.unique(tile["mask"]))
+    present = sorted(present)
 
-    # Filter by desired classes
+    # 4) filtra conforme desired_classes
     if desired_classes is not None:
-        used_classes = [c for c in present_classes if c in desired_classes]
+        used = [c for c in present if c in desired_classes]
     else:
-        used_classes = present_classes
+        used = present[:]
+    if 0 in present and 0 not in used:
+        used.insert(0, 0)
 
-    if 0 in present_classes and 0 not in used_classes:
-        used_classes = [0] + used_classes
+    # 5) mapeamento e colormaps
+    class_remap = {orig: new for new, orig in enumerate(used)}
+    mask_cmap = ListedColormap([full_mask_colors[c] for c in used])
+    legend_handles = [Patch(color=full_mask_colors[c], label=full_class_labels[c])
+                      for c in used]
 
-    # Reindex classes and define colormaps
-    class_remap = {original: new_idx for new_idx, original in enumerate(used_classes)}
-    mask_cmap = ListedColormap([full_mask_colors[c] for c in used_classes])
-    overlay_cmap = ListedColormap([full_overlay_colors[c] for c in used_classes])
-    legend_handles = [Patch(color=full_overlay_colors[c], label=full_class_labels[c]) for c in used_classes]
+    # overlay totalmente opaco
+    overlay_colors = [
+        (0,0,0,0.0),
+        (0.12,0.47,0.71,1.0),
+        (0.20,0.63,0.17,1.0),
+        (0.84,0.15,0.16,1.0),
+        (0.58,0.40,0.74,1.0),
+        (0.10,0.74,0.81,1.0),
+    ]
+    overlay_cmap = ListedColormap([overlay_colors[c] for c in used])
 
-    # Plot
+    # 6) função de contraste 2–98%
+    def stretch(img):
+        out = np.zeros_like(img, dtype=np.float32)
+        for k in range(3):
+            p2, p98 = np.percentile(img[...,k], (2,98))
+            if p98 > p2:
+                out[...,k] = np.clip((img[...,k] - p2)/(p98-p2), 0, 1)
+        return out
+
+    # 7) helper de down‑sample
+    def downsample(rgb, mask_idx):
+        h, w = rgb.shape[:2]
+        new_w, new_h = int(w*scale), int(h*scale)
+        # RGB: converte pra uint8, redimensiona e volta para float
+        pil_rgb = Image.fromarray((rgb*255).astype(np.uint8))
+        rgb_ds  = np.asarray(pil_rgb.resize((new_w,new_h), Image.BILINEAR)) / 255.0
+        # máscara: nearest
+        pil_m  = Image.fromarray(mask_idx.astype(np.uint8))
+        m_ds   = np.asarray(pil_m.resize((new_w,new_h), Image.NEAREST))
+        return rgb_ds, m_ds
+
+    # 8) plot em grid
     n = len(tiles_data)
-    fig, axes = plt.subplots(n, 3, figsize=(12, 4 * n))
+    fig, axes = plt.subplots(n, 3, figsize=(12, 4*n))
     if n == 1:
-        axes = np.expand_dims(axes, 0)
+        axes = axes[np.newaxis,:]
 
-    for idx, tile in enumerate(tiles_data):
-        image = tile["image"]
-        mask = tile["mask"]
-        tile_id = tile["tile_id"]
+    for i, tile in enumerate(tiles_data):
+        img = tile["image"]   # pode ser CHW ou HWC
+        msk = tile["mask"]
+        tid = tile["tile_id"]
 
-        # Reindex classes
-        mask_reindexed = np.vectorize(class_remap.get)(mask)
+        # 8a) remapeia máscara
+        m_idx = np.zeros_like(msk, dtype=np.int32)
+        for orig, new in class_remap.items():
+            m_idx[msk == orig] = new
 
-        # Convert to RGB
-        if image.ndim == 3 and image.shape[0] in [3, 4]:  # CHW
-            rgb = image[:3].transpose(1, 2, 0)
-        elif image.ndim == 3 and image.shape[2] in [3, 4]:  # HWC
-            rgb = image[:, :, :3]
+        # 8b) extrai RGB em HWC
+        if img.ndim==3 and img.shape[0] in (3,4):
+            rgb = img[:3].transpose(1,2,0)
+        elif img.ndim==3 and img.shape[2] in (3,4):
+            rgb = img[...,:3]
         else:
-            rgb = np.repeat(image[None, :, :], 3, axis=0).transpose(1, 2, 0)
+            rgb = np.repeat(img[np.newaxis],3,axis=0).transpose(1,2,0)
 
-        axes[idx, 0].imshow(rgb)
-        axes[idx, 0].set_title(f"Image: {tile_id}", fontsize=10)
-        axes[idx, 0].axis('off')
+        # 8c) converte / clipa
+        if np.issubdtype(rgb.dtype, np.integer):
+            rgb = rgb.astype(np.float32)/255.0
+        else:
+            rgb = np.clip(rgb,0,1)
 
-        axes[idx, 1].imshow(mask_reindexed, cmap=mask_cmap, interpolation='nearest', vmin=0, vmax=len(used_classes)-1)
-        axes[idx, 1].set_title("Mask", fontsize=10)
-        axes[idx, 1].axis('off')
+        # 8d) contraste
+        rgb = stretch(rgb)
 
-        axes[idx, 2].imshow(rgb)
-        axes[idx, 2].imshow(mask_reindexed, cmap=overlay_cmap, interpolation='nearest', vmin=0, vmax=len(used_classes)-1)
-        axes[idx, 2].set_title("Overlay", fontsize=10)
-        axes[idx, 2].axis('off')
+        # 8e) down‑sample se solicitado
+        if scale < 1.0:
+            rgb, m_idx = downsample(rgb, m_idx)
 
-    fig.legend(handles=legend_handles, loc='upper right', bbox_to_anchor=(1.1, 1.0), fontsize=9,
-               title="Class Index", title_fontsize=10, frameon=True)
+        # 8f1) imagem pura
+        ax = axes[i,0]
+        ax.imshow(rgb)
+        ax.set_title(f"Image: {tid}", fontsize=10)
+        ax.axis('off')
+
+        # 8f2) máscara
+        ax = axes[i,1]
+        ax.imshow(m_idx, cmap=mask_cmap,
+                  interpolation='nearest',
+                  vmin=0, vmax=len(used)-1)
+        ax.set_title("Mask", fontsize=10)
+        ax.axis('off')
+
+        # 8f3) overlay
+        ax = axes[i,2]
+        ax.imshow(rgb)
+        ax.imshow(m_idx, cmap=overlay_cmap,
+                  interpolation='nearest',
+                  vmin=0, vmax=len(used)-1)
+        # contorno grosso
+        for new_idx in range(1, len(used)):
+            binary = (m_idx == new_idx).astype(np.uint8)
+            ax.contour(binary,
+                       levels=[0.5],
+                       colors=['white'],
+                       linewidths=2.0)
+        ax.set_title("Overlay", fontsize=10)
+        ax.axis('off')
+
+    # 9) legenda
+    fig.legend(handles=legend_handles,
+               loc='upper right',
+               bbox_to_anchor=(1.1,1.0),
+               fontsize=9,
+               title="Class Index",
+               title_fontsize=10,
+               frameon=True)
 
     plt.tight_layout()
     plt.show()
+    plt.close(fig)
 
-def generate_patches_from_tiles_data(tiles_data, output_dir, patch_size=512, overlap=0):
-    # Clean output directories first
+
+def generate_patches_from_tiles_data(
+    tiles_data,
+    output_dir,
+    patch_size=512,
+    overlap=0,
+    include_empty=True   # <<< now you control whether to save pure background patches
+):
+    # Clean output directories
     clean_output_dirs(output_dir)
-
-    img_out_dir = os.path.join(output_dir, 'images')
-    msk_out_dir = os.path.join(output_dir, 'masks')
-
-    os.makedirs(img_out_dir, exist_ok=True)
-    os.makedirs(msk_out_dir, exist_ok=True)
+    img_out = os.path.join(output_dir, 'images')
+    msk_out = os.path.join(output_dir, 'masks')
+    os.makedirs(img_out, exist_ok=True)
+    os.makedirs(msk_out, exist_ok=True)
 
     total_saved = 0
+    stats = defaultdict(int)  # optional: count how many patches of each type
 
     for tile in tiles_data:
-        tile_id = tile['tile_id']
-        image = tile['image']  # [C, H, W]
-        mask = tile['mask']    # [H, W]
+        tid   = tile['tile_id']
+        img   = tile['image']   # [C, H, W]
+        msk   = tile['mask']    # [H, W]
 
-        # Transpose image to [H, W, C]
-        if image.ndim == 3 and image.shape[0] in [3, 4]:
-            img = image.transpose(1, 2, 0)
+        # Transpose to H, W, C
+        if img.ndim == 3 and img.shape[0] in (3,4):
+            img = img.transpose(1, 2, 0)
         else:
-            raise ValueError(f"Invalid image shape in tile {tile_id}")
+            raise ValueError(f"Invalid format in tile {tid}: {img.shape}")
 
-        H, W = mask.shape
+        H, W = msk.shape
         stride = patch_size - overlap
 
-        patch_count = 0
         for y in range(0, H - patch_size + 1, stride):
             for x in range(0, W - patch_size + 1, stride):
                 img_patch = img[y:y+patch_size, x:x+patch_size, :]
-                msk_patch = mask[y:y+patch_size, x:x+patch_size]
+                msk_patch = msk[y:y+patch_size, x:x+patch_size]
 
-                # Skip if mask contains only background
-                if np.all(msk_patch == 0):
+                # Calculate percentage of background
+                frac_bg = np.mean(msk_patch == 0)
+                # if include_empty=False and patch is only background, skip
+                if not include_empty and frac_bg == 1.0:
+                    stats['skipped_empty'] += 1
                     continue
 
-                patch_name = f"{tile_id}_patch_{y}_{x}.tif"
-                imsave(os.path.join(img_out_dir, patch_name), img_patch, photometric='rgb')
-                imsave(os.path.join(msk_out_dir, patch_name.replace('.tif', '_mask.tif')), msk_patch)
+                # save
+                name = f"{tid}_y{y}_x{x}.tif"
+                imsave(os.path.join(img_out, name),
+                       img_patch, photometric='rgb')
+                msk_name = name.replace('.tif', '_mask.tif')
+                imsave(os.path.join(msk_out, msk_name), msk_patch)
 
-                patch_count += 1
                 total_saved += 1
+                # categorize for quick statistics
+                if frac_bg == 1.0:
+                    stats['empty'] += 1
+                else:
+                    stats['non_empty'] += 1
 
-        print(f"✅ {patch_count} patches saved from tile {tile_id}")
+        print(f"Tile {tid}: patches saved so far: {total_saved}")
 
-    print(f"\n🎉 Finished: {total_saved} total image/mask pairs saved in '{output_dir}'")
+    print(f"\n🎉 Total patches saved: {total_saved}")
+    print("📊 Quick patch statistics:")
+    for k, v in stats.items():
+        print(f"  {k}: {v}")
 
 def clean_output_dirs(output_dir):
     img_dir = os.path.join(output_dir, 'images')
@@ -488,125 +578,156 @@ def clean_output_dirs(output_dir):
             shutil.rmtree(d)
         os.makedirs(d, exist_ok=True)
 
-def visualize_image_mask_overlay(images_dir, masks_dir, desired_classes=None, max_items=None, selected_indices=None):
-    # Get only .tif and _mask.tif files
-    image_files = sorted([f for f in os.listdir(images_dir) if f.endswith('.tif')])
-    mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith('_mask.tif')])
+def visualize_image_mask_overlay(
+    images_dir,
+    masks_dir,
+    desired_classes=None,
+    max_items=None,
+    selected_indices=None
+):
+    # 1) lista e casa arquivos
+    imgs = sorted([f for f in os.listdir(images_dir) if f.endswith('.tif')])
+    msks = sorted([f for f in os.listdir(masks_dir)  if f.endswith('_mask.tif')])
+    base_i = [f[:-4] for f in imgs]
+    base_m = [f[:-9] for f in msks]
+    common = sorted(set(base_i) & set(base_m))
+    image_files = [f + '.tif'      for f in common]
+    mask_files  = [f + '_mask.tif' for f in common]
 
-    # Match by basename
-    image_basenames = [f.replace('.tif', '') for f in image_files]
-    mask_basenames = [f.replace('_mask.tif', '') for f in mask_files]
-    common = sorted(list(set(image_basenames) & set(mask_basenames)))
-
-    image_files = [f + '.tif' for f in common]
-    mask_files = [f + '_mask.tif' for f in common]
-
-    # Select specific indices if provided
+    # 2) seleção por índice e limite
     if selected_indices:
-        # Ensure no index is out of bounds
-        selected_indices = [i for i in selected_indices if i < len(image_files)]
-        image_files = [image_files[i] for i in selected_indices]
-        mask_files = [mask_files[i] for i in selected_indices]
-
-    # Limit to max_items
-    n_total = len(image_files)
+        image_files = [image_files[i] for i in selected_indices if i < len(common)]
+        mask_files  = [mask_files[i]  for i in selected_indices if i < len(common)]
     if max_items:
         image_files = image_files[:max_items]
-        mask_files = mask_files[:max_items]
+        mask_files  = mask_files[:max_items]
 
-    # Full label info
-    full_class_labels = [
-        "0: background",
-        "1: no trees",
-        "2: other vegetation",
-        "3: pinus",
-        "4: eucalyptus",
-        "5: shadow"
+    # 3) definição de classes e cores
+    full_labels = [
+        "0: background","1: no trees","2: other vegetation",
+        "3: pinus","4: eucalyptus","5: shadow"
     ]
     full_mask_colors = [
-        (0, 0, 0, 1.0),
-        (0.12, 0.47, 0.71, 0.6),
-        (0.20, 0.63, 0.17, 0.6),
-        (0.84, 0.15, 0.16, 0.6),
-        (0.58, 0.40, 0.74, 0.6),
-        (0.10, 0.74, 0.81, 0.6)
+        (0,0,0,1.0),
+        (0.12,0.47,0.71,0.6),
+        (0.20,0.63,0.17,0.6),
+        (0.84,0.15,0.16,0.6),
+        (0.58,0.40,0.74,0.6),
+        (0.10,0.74,0.81,0.6),
     ]
     full_overlay_colors = [
-        (0, 0, 0, 0.0),
-        (0.12, 0.47, 0.71, 0.15),
-        (0.20, 0.63, 0.17, 0.15),
-        (0.84, 0.15, 0.16, 0.15),
-        (0.58, 0.40, 0.74, 0.15),
-        (0.10, 0.74, 0.81, 0.15)
+        (0,0,0,0.0),
+        (0.12,0.47,0.71,1.0),
+        (0.20,0.63,0.17,1.0),
+        (0.84,0.15,0.16,1.0),
+        (0.58,0.40,0.74,1.0),
+        (0.10,0.74,0.81,1.0),
     ]
 
-    # Check classes present in selected masks
-    present_classes = set()
+    # 4) quais classes aparecem?
+    present = set()
     for mf in mask_files:
-        mask = tiff.imread(os.path.join(masks_dir, mf))
-        present_classes.update(np.unique(mask))
-    present_classes = sorted(present_classes)
+        arr = tiff.imread(os.path.join(masks_dir, mf))
+        present.update(np.unique(arr))
+    present = sorted(present)
 
-    # Filter by desired_classes
+    # 5) filtra se necessário
     if desired_classes is not None:
-        used_classes = [c for c in present_classes if c in desired_classes]
+        used = [c for c in present if c in desired_classes]
     else:
-        used_classes = present_classes
+        used = present[:]
+    if 0 in present and 0 not in used:
+        used.insert(0, 0)
 
-    if 0 in present_classes and 0 not in used_classes:
-        used_classes = [0] + used_classes
+    # 6) remap, cmaps e legenda
+    class_remap = {orig: new for new, orig in enumerate(used)}
+    mask_cmap    = ListedColormap([full_mask_colors[c]    for c in used])
+    overlay_cmap = ListedColormap([full_overlay_colors[c] for c in used])
+    legend_handles = [
+        Patch(color=full_overlay_colors[c], label=full_labels[c])
+        for c in used
+    ]
 
-    # Create remap dict
-    class_remap = {original: new_idx for new_idx, original in enumerate(used_classes)}
+    # 7) stretch percentil 2–98%
+    def stretch_rgb(rgb):
+        out = np.zeros_like(rgb, dtype=np.float32)
+        for k in range(3):
+            p2, p98 = np.percentile(rgb[...,k], (2, 98))
+            if p98 > p2:
+                out[...,k] = np.clip((rgb[...,k] - p2)/(p98-p2), 0, 1)
+        return out
 
-    # Color maps
-    mask_cmap = ListedColormap([full_mask_colors[c] for c in used_classes])
-    overlay_cmap = ListedColormap([full_overlay_colors[c] for c in used_classes])
-    legend_handles = [Patch(color=full_overlay_colors[c], label=full_class_labels[c]) for c in used_classes]
-
-    # Plotting
+    # 8) plota
     n = len(image_files)
-    fig, axes = plt.subplots(n, 3, figsize=(8, 4 * n))
+    fig, axes = plt.subplots(n, 3, figsize=(8, 4*n))
     if n == 1:
-        axes = np.expand_dims(axes, 0)
+        axes = axes[np.newaxis, :]
 
-    for idx, (image_file, mask_file) in enumerate(zip(image_files, mask_files)):
-        image_path = os.path.join(images_dir, image_file)
-        mask_path = os.path.join(masks_dir, mask_file)
+    for i, (ifile, mfile) in enumerate(zip(image_files, mask_files)):
+        img = tiff.imread(os.path.join(images_dir, ifile))
+        msk = tiff.imread(os.path.join(masks_dir,  mfile))
 
-        image = tiff.imread(image_path)
-        mask = tiff.imread(mask_path)
+        # 8a) remap máscara
+        m_idx = np.zeros_like(msk, dtype=np.int32)
+        for orig, new in class_remap.items():
+            m_idx[msk == orig] = new
 
-        # Reindex mask values
-        mask_reindexed = np.vectorize(class_remap.get)(mask)
-
-        # Convert to RGB
-        if image.ndim == 3 and image.shape[0] in [3, 4]:
-            rgb = image[:3].transpose(1, 2, 0)
-        elif image.ndim == 3 and image.shape[2] in [3, 4]:
-            rgb = image[:, :, :3]
+        # 8b) extrai RGB em HWC
+        if img.ndim == 3 and img.shape[0] in (3,4):
+            rgb = img[:3].transpose(1,2,0)
+        elif img.ndim == 3 and img.shape[2] in (3,4):
+            rgb = img[..., :3]
         else:
-            rgb = np.repeat(image[None, :, :], 3, axis=0).transpose(1, 2, 0)
+            rgb = np.repeat(img[np.newaxis], 3, axis=0).transpose(1,2,0)
 
-        # Image
-        axes[idx, 0].imshow(rgb)
-        axes[idx, 0].set_title("Image", fontsize=10)
-        axes[idx, 0].axis('off')
+        # 8c) converte inteiros→float ou clipa floats
+        if np.issubdtype(rgb.dtype, np.integer):
+            rgb = rgb.astype(np.float32) / 255.0
+        else:
+            rgb = np.clip(rgb, 0, 1)
 
-        # Mask
-        axes[idx, 1].imshow(mask_reindexed, cmap=mask_cmap, interpolation='nearest', vmin=0, vmax=len(used_classes)-1)
-        axes[idx, 1].set_title("Mask", fontsize=10)
-        axes[idx, 1].axis('off')
+        # 8d) aplica stretch
+        rgb = stretch_rgb(rgb)
 
-        # Overlay
-        axes[idx, 2].imshow(rgb)
-        axes[idx, 2].imshow(mask_reindexed, cmap=overlay_cmap, interpolation='nearest', vmin=0, vmax=len(used_classes)-1)
-        axes[idx, 2].set_title("Overlay", fontsize=10)
-        axes[idx, 2].axis('off')
+        # 8e1) subplot RGB
+        ax = axes[i,0]
+        ax.imshow(rgb)
+        ax.set_title("Image", fontsize=10)
+        ax.axis("off")
 
-    # Legend
-    fig.legend(handles=legend_handles, loc='upper right', bbox_to_anchor=(1.1, 1.0), fontsize=9,
-               title="Class Index", title_fontsize=10, frameon=True)
+        # 8e2) subplot máscara
+        ax = axes[i,1]
+        ax.imshow(m_idx,
+                  cmap=mask_cmap,
+                  interpolation="nearest",
+                  vmin=0, vmax=len(used)-1)
+        ax.set_title("Mask", fontsize=10)
+        ax.axis("off")
+
+        # 8e3) subplot overlay
+        ax = axes[i,2]
+        ax.imshow(rgb)
+        ax.imshow(m_idx,
+                  cmap=overlay_cmap,
+                  interpolation="nearest",
+                  vmin=0, vmax=len(used)-1)
+        # contorno branco grosso
+        for new_idx in range(1, len(used)):
+            binar = (m_idx == new_idx).astype(np.uint8)
+            ax.contour(binar,
+                       levels=[0.5],
+                       colors=["white"],
+                       linewidths=2.0)
+        ax.set_title("Overlay", fontsize=10)
+        ax.axis("off")
+
+    fig.legend(handles=legend_handles,
+               loc="upper right",
+               bbox_to_anchor=(1.1, 1.0),
+               fontsize=9,
+               title="Class Index",
+               title_fontsize=10,
+               frameon=True)
 
     plt.tight_layout()
     plt.show()
