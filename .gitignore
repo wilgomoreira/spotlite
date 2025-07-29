@@ -3,3 +3,4 @@
 *.pth
 *.pyc
 /plot_3d_features
+/comparisons
